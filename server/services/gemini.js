@@ -4,6 +4,7 @@
  * Includes in-memory cache (60s) and template fallback when no key is set.
  */
 
+import { GoogleGenAI } from '@google/genai';
 import { TTLCache } from '../utils/cache.js';
 
 /** @type {TTLCache} */
@@ -13,38 +14,16 @@ const explainCache = new TTLCache(60_000, 100);
 let genAIClient = null;
 
 /**
- * Lazily initializes the Gemini client.
- * @returns {import('@google/genai').GoogleGenAI|null}
+ * Lazily initializes the Gemini client if an API key is present.
+ * Safe to call multiple times.
  */
-function getClient() {
-  if (genAIClient) return genAIClient;
+function ensureClient() {
+  if (genAIClient) return;
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) return;
 
-  // Dynamic import to avoid issues when the SDK isn't needed
-  try {
-    // Use require-like pattern for the already-installed package
-    const { GoogleGenAI } = /** @type {any} */ (
-      // @ts-ignore — dynamic import handled at runtime
-      await import('@google/genai')
-    );
-    genAIClient = new GoogleGenAI({ apiKey });
-    return genAIClient;
-  } catch {
-    return null;
-  }
-}
-
-// Pre-initialize at module load (top-level await in ESM)
-try {
-  if (process.env.GEMINI_API_KEY) {
-    const { GoogleGenAI } = await import('@google/genai');
-    genAIClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  }
-} catch {
-  // SDK not available — template fallback will be used
-  genAIClient = null;
+  genAIClient = new GoogleGenAI({ apiKey });
 }
 
 /**
@@ -72,9 +51,10 @@ export async function explainRecommendation(input) {
   // ─── Cache check ─────────────────────────────
   const cacheKey = `${input.recommendationId}-${input.matchMinute}-${input.userZone}`;
   const cached = explainCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  if (cached) return cached;
+
+  // ─── Try to init Gemini (no-op if no key) ───
+  ensureClient();
 
   let result;
 
@@ -83,7 +63,7 @@ export async function explainRecommendation(input) {
     try {
       result = await callGemini(input);
     } catch (err) {
-      console.warn('Gemini API call failed, using template fallback:', err.message);
+      console.warn('Gemini API call failed, using template fallback:', err?.message || err);
       result = templateExplanation(input);
     }
   } else {
@@ -101,6 +81,11 @@ export async function explainRecommendation(input) {
  * @returns {Promise<{ explanation: string, source: 'gemini' }>}
  */
 async function callGemini(input) {
+  // Safety: ensure client exists
+  if (!genAIClient) {
+    return { explanation: templateExplanation(input).explanation, source: 'gemini' };
+  }
+
   const prompt = buildPrompt(input);
 
   const response = await genAIClient.models.generateContent({
@@ -153,9 +138,10 @@ export function templateExplanation(input) {
   const context = phaseContext[input.phaseLabel] || 'Right now';
   const topReason = input.reasoning[0] || 'It scored highest overall';
 
-  const explanation = `${context}, ${input.name} is your best option for ${input.type}. ${topReason}, and it's located in a ${
-    input.breakdown.crowdDensity > 0.6 ? 'relatively quiet' : 'moderately busy'
-  } area. With a wait time of just ${input.waitTime} minutes, you can get there and back without missing much of the action.`;
+  // NOTE: If you want, we can flip the "quiet/busy" wording later.
+  const crowdText = input.breakdown.crowdDensity > 0.6 ? 'moderately busy' : 'relatively quiet';
+
+  const explanation = `${context}, ${input.name} is your best option for ${input.type}. ${topReason}, and it's located in a ${crowdText} area. With a wait time of just ${input.waitTime} minutes, you can get there and back without missing much of the action.`;
 
   return { explanation, source: 'template' };
 }
